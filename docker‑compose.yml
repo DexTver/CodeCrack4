@@ -1,0 +1,14 @@
+version: "3.9"
+services:
+  bot:
+    build: .
+    # готовый образ из Docker Hub:
+    # image: ghcr.io/<user>/kodmaster4-bot:latest
+    restart: unless-stopped
+
+    # секреты
+    env_file: .env            # или используйте secrets/opentofu/систему хоста
+
+    # сохраняем рекорды на диск хоста
+    volumes:
+      - ./data:/app/data      # создастся каталог ./data
