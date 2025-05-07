@@ -1,19 +1,9 @@
-#!/usr/bin/env python3
-"""
-Telegram‑бот «Код‑Мастер 4» — угадай 4‑значный секретный код.
-
-📦  Новое: *персистентные рекорды* — лучшие результаты игроков хранятся в файле
-     `records.json` и переживают перезапуски бота.
-
-• `.env`  —  BOT_TOKEN=…
-• Зависимости:  `python-telegram-bot>=20`  `python-dotenv`
-"""
-
 import json
 import logging
 import os
 import random
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -26,178 +16,218 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import HTTPXRequest
-from telegram.error import NetworkError
+from telegram.error import NetworkError, BadRequest
 
 # ---------------------------------------------------------------------------
-# 1. Настройки и инициализация
+# 1.  Настройки и рекорды
 # ---------------------------------------------------------------------------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("Переменная BOT_TOKEN не задана (см. .env)")
+    raise RuntimeError("Добавьте BOT_TOKEN в .env")
 
 CODE_LENGTH = 4
 RECORD_FILE = Path("records.json")
 
 
-def load_records() -> dict[int, int]:
-    """Читает JSON‑файл рекордов. Формат: {user_id(str): attempts(int)}"""
+def load_records() -> dict[int, dict[str, int]]:
+    """Формат: {user_id: {"easy": best, "hard": best}}"""
     if RECORD_FILE.exists():
         try:
-            data = json.loads(RECORD_FILE.read_text("utf‑8"))
-            return {int(uid): int(best) for uid, best in data.items()}
-        except (json.JSONDecodeError, ValueError):
-            logging.warning("Не удалось прочитать records.json — начинаем с пустой базы.")
+            raw = json.loads(RECORD_FILE.read_text("utf‑8"))
+            return {int(u): {m: int(v) for m, v in d.items()} for u, d in raw.items()}
+        except Exception as e:
+            logging.warning("records.json повреждён: %s", e)
     return {}
 
 
-def save_records(records: dict[int, int]) -> None:
-    """Атомично сохраняет рекорды на диск."""
+def save_records(records):
     tmp = RECORD_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(records, ensure_ascii=False), "utf‑8")
     tmp.replace(RECORD_FILE)
 
 
-RECORDS: dict[int, int] = load_records()
+RECORDS = load_records()
 
 # ---------------------------------------------------------------------------
-# 2. Вспомогательные функции и UI‑элементы
+# 2.  helpers
 # ---------------------------------------------------------------------------
 
-def generate_secret(length: int = CODE_LENGTH) -> str:
-    return "".join(str(random.randint(0, 9)) for _ in range(length))
+def generate_secret():
+    return "".join(str(random.randint(0, 9)) for _ in range(CODE_LENGTH))
 
 
-def main_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([["🎮 Новая игра", "🏆 Рекорд"]], resize_keyboard=True)
-
-# ---------------------------------------------------------------------------
-# 3. Обработчики команд
-# ---------------------------------------------------------------------------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    intro = (
-        "🤖 *Код‑Мастер 4*\n\n"
-        "Я загадываю *секретный 4‑значный код*. Ваша цель — угадать все цифры и их позиции. "
-        "После каждой попытки я показываю шаблон (пример: `4*2*`). "
-        "Звёздочки `*` — ещё не раскрытые позиции.\n\n"
-        "Нажмите *«🎮 Новая игра»* или отправьте код из 4 цифр."
+def make_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [["🎮 Easy", "😎 Hard"], ["🏆 Рекорд"]], resize_keyboard=True
     )
-    await update.message.reply_text(intro, parse_mode="Markdown", reply_markup=main_keyboard())
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def pattern_for_guess(secret: str, guess: str) -> str:
+    return "".join(g if g == s else "*" for g, s in zip(guess, secret))
+
+# ---------------------------------------------------------------------------
+# 3.  После перезапуска
+# ---------------------------------------------------------------------------
+BOOT_TIME = datetime.now(timezone.utc)
+APOLOGIZED_USERS: set[int] = set()
+
+
+def is_old(update: Update) -> bool:
+    msg_time = update.message.date
+    if msg_time.tzinfo is None:
+        msg_time = msg_time.replace(tzinfo=timezone.utc)
+    return msg_time < BOOT_TIME
+
+# ---------------------------------------------------------------------------
+# 4.  Команды
+# ---------------------------------------------------------------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Команды:\n"
-        "/newgame — начать новую игру\n"
-        "/record — показать ваш рекорд",
-        reply_markup=main_keyboard(),
+        "🤖 *Код‑Мастер 4* — угадай 4‑значный код.\n\n"
+        "*Easy* — угаданные цифры раскрываются навсегда.\n"
+        "*Hard* — результат виден только для текущей попытки.\n\n"
+        "Выберите режим кнопкой или пришлите 4 цифры.",
+        parse_mode="Markdown",
+        reply_markup=make_keyboard(),
     )
 
 
-async def new_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.update({
-        "secret": generate_secret(),
-        "revealed": ["*"] * CODE_LENGTH,
-        "attempts": 0,
-    })
-    await update.message.reply_text("🎲 Я загадал новый 4‑значный код. Удачи!", reply_markup=main_keyboard())
+async def new_game(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
+    context.user_data.clear()
+    context.user_data.update(
+        {
+            "secret": generate_secret(),
+            "attempts": 0,
+            "mode": mode,           # "easy" | "hard"
+            "revealed": ["*"] * CODE_LENGTH,  # только для easy
+        }
+    )
+    await update.message.reply_text(
+        f"🎲 Новая игра *{mode.title()}*. Я загадал код!",
+        parse_mode="Markdown",
+        reply_markup=make_keyboard(),
+    )
 
 
-async def show_record(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    best = RECORDS.get(user_id)
-    msg = "Вы ещё не установили рекорд. Сыграйте пару партий!" if best is None else f"Ваш лучший результат — *{best}* попыток."
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=main_keyboard())
+async def record_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    rec = RECORDS.get(uid, {})
+    msg = []
+    for mode in ("easy", "hard"):
+        val = rec.get(mode)
+        msg.append(f"{mode.title()}: {val if val else '—'}")
+    await update.message.reply_text("Ваши рекорды:\n" + " | ".join(msg), reply_markup=make_keyboard())
 
 # ---------------------------------------------------------------------------
-# 4. Игровая логика
+# 5.  Игровой поток
 # ---------------------------------------------------------------------------
 
-async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    # 5.1 Сообщения во время простоя
+    if is_old(update):
+        if uid not in APOLOGIZED_USERS:
+            await update.message.reply_text(
+                "Извините, бот был недоступен. Сейчас снова онлайн!",
+                reply_markup=make_keyboard(),
+            )
+            APOLOGIZED_USERS.add(uid)
+        return
+
     text = update.message.text.strip()
-    user_id = update.effective_user.id
 
-    # Кнопки клавиатуры
-    if text == "🎮 Новая игра":
-        await new_game(update, context)
+    # 5.2 Выбор режима кнопкой
+    if text in {"🎮 Easy", "😎 Hard"}:
+        mode = "easy" if "Easy" in text else "hard"
+        await new_game(update, context, mode)
         return
     if text == "🏆 Рекорд":
-        await show_record(update, context)
+        await record_cmd(update, context)
         return
 
-    # Валидация ввода
+    # 5.3 Проверка на код
     if not text.isdigit() or len(text) != CODE_LENGTH:
-        await update.message.reply_text(
-            f"Введите ровно {CODE_LENGTH} цифры, без пробелов и букв.",
-            reply_markup=main_keyboard(),
-        )
+        await update.message.reply_text(f"Введите ровно {CODE_LENGTH} цифры.", reply_markup=make_keyboard())
         return
 
-    # Инициализация игры при первом запросе
+    # 5.4 Если игра ещё не начата — по умолчанию Easy
     if "secret" not in context.user_data:
-        context.user_data.update({
-            "secret": generate_secret(),
-            "revealed": ["*"] * CODE_LENGTH,
-            "attempts": 0,
-        })
-
-    secret: str = context.user_data["secret"]
+        await new_game(update, context, "easy")
+    mode = context.user_data["mode"]
+    secret = context.user_data["secret"]
     context.user_data["attempts"] += 1
 
-    for i, (g_digit, s_digit) in enumerate(zip(text, secret)):
-        if g_digit == s_digit:
-            context.user_data["revealed"][i] = g_digit
+    # 5.5  HARD: удаляем старую пару сообщений
+    if mode == "hard":
+        for key in ("last_user_msg", "last_bot_msg"):
+            mid = context.user_data.get(key)
+            if mid:
+                try:
+                    await update.effective_chat.delete_message(mid)
+                except BadRequest:
+                    pass  # сообщение уже удалено / старше 48h
+        context.user_data["last_user_msg"] = update.message.message_id
 
-    pattern = "".join(context.user_data["revealed"])
-    await update.message.reply_text(f"Результат: `{pattern}`", parse_mode="Markdown")
+    # 5.6 Формируем ответ
+    if mode == "easy":
+        for i, (g, s) in enumerate(zip(text, secret)):
+            if g == s:
+                context.user_data["revealed"][i] = g
+        pattern = "".join(context.user_data["revealed"])
+    else:  # hard
+        pattern = pattern_for_guess(secret, text)
 
-    # Победа?
+    bot_msg = await update.message.reply_text(
+        f"Результат: `{pattern}`", parse_mode="Markdown"
+    )
+    if mode == "hard":
+        context.user_data["last_bot_msg"] = bot_msg.message_id
+
+    # 5.7  Победа
     if text == secret:
         attempts = context.user_data["attempts"]
-        best = RECORDS.get(user_id)
-        new_record = best is None or attempts < best
-        if new_record:
-            RECORDS[user_id] = attempts
+        best = RECORDS.get(uid, {}).get(mode)
+        new_best = best is None or attempts < best
+        if new_best:
+            RECORDS.setdefault(uid, {})[mode] = attempts
             save_records(RECORDS)
         await update.message.reply_text(
-            f"🎉 Поздравляю! Код *{secret}* угадан за *{attempts}* попыток." +
-            ("\n🏆 Это новый рекорд!" if new_record else "") +
-            "\nНажмите «🎮 Новая игра», чтобы сыграть снова.",
+            f"🎉 *{mode.title()}* победа! Код `{secret}` угадан за *{attempts}* попыток." +
+            ("\n🏆 Новый рекорд!" if new_best else "") +
+            "\nВыберите режим, чтобы сыграть снова.",
             parse_mode="Markdown",
-            reply_markup=main_keyboard(),
+            reply_markup=make_keyboard(),
         )
-        for key in ("secret", "revealed", "attempts"):
-            context.user_data.pop(key, None)
+        context.user_data.clear()
 
 # ---------------------------------------------------------------------------
-# 5. Запуск с автоперезапуском при сетевых ошибках
+# 6.  Запуск приложения
 # ---------------------------------------------------------------------------
 
 def create_app():
-    request = HTTPXRequest(connect_timeout=10.0, read_timeout=15.0, write_timeout=15.0)
-    return ApplicationBuilder().token(BOT_TOKEN).request(request).build()
+    req = HTTPXRequest(connect_timeout=10.0, read_timeout=15.0, write_timeout=15.0)
+    return ApplicationBuilder().token(BOT_TOKEN).request(req).build()
 
 
-def main() -> None:
-    logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+def main():
+    logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 
     while True:
         app = create_app()
         app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("newgame", new_game))
-        app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(CommandHandler("record", show_record))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_guess))
+        app.add_handler(CommandHandler("record", record_cmd))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
         try:
             print("Bot is running… Press Ctrl‑C to stop.")
-            app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=None)
+            app.run_polling(stop_signals=None)
         except NetworkError as e:
-            logging.warning("NetworkError: %s — перезапуск через 5 секунд…", e)
+            logging.warning("NetworkError: %s — перезапуск через 5 с", e)
             time.sleep(5)
         except KeyboardInterrupt:
-            print("⏹  Bot stopped by user.")
             break
 
 
